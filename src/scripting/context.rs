@@ -1057,11 +1057,10 @@ impl Context {
             all_pages_duration += current_duration;
             match paging_state_response.clone().into_paging_control_flow() {
                 ControlFlow::Break(()) => {
-                    self.stats.try_lock().unwrap().complete_request(
-                        all_pages_duration,
-                        Some(rows_num),
-                        &rs,
-                    );
+                    self.stats
+                        .try_lock()
+                        .unwrap()
+                        .complete_request(all_pages_duration, rows_num);
                     if process_and_return_data {
                         // Convert the collected rows to Rune values
                         let mut rune_rows = RuneVec::new();
@@ -1189,11 +1188,10 @@ impl Context {
                     let duration = Instant::now() - start_time;
                     match rs {
                         Ok(_) => {
-                            self.stats.try_lock().unwrap().complete_request_batch(
-                                duration,
-                                Some(batch_values.len() as u64),
-                                &rs,
-                            );
+                            self.stats
+                                .try_lock()
+                                .unwrap()
+                                .complete_request(duration, batch_values.len() as u64);
                             return Ok(());
                         }
                         Err(e) => {
