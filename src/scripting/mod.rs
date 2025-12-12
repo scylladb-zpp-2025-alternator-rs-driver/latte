@@ -10,9 +10,9 @@ mod split_lines_iter;
 pub mod uuid;
 
 #[cfg(feature = "alternator")]
-mod alternator;
+pub(crate) mod alternator;
 #[cfg(feature = "cql")]
-mod cql;
+pub(crate) mod cql;
 
 #[cfg(feature = "cql")]
 pub use cql::cass_error as db_error;
