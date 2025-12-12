@@ -508,6 +508,7 @@ impl Display for RunConfigCmp<'_> {
             self.line("Consistency", "", |conf| {
                 conf.connection.consistency.consistency().to_string()
             }),
+            #[cfg(feature = "cql")]
             self.line("Serial consistency", "", |conf| {
                 conf.connection
                     .serial_consistency
