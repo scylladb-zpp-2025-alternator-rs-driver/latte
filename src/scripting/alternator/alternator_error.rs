@@ -1,7 +1,8 @@
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use rune::alloc::fmt::TryWrite;
 use rune::runtime::VmResult;
 use rune::{vm_write, Any};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Any, Debug)]
 pub struct AlternatorError(pub AlternatorErrorKind);
@@ -14,11 +15,19 @@ pub enum AlternatorErrorKind {
     PartitionRowPresetNotFound(String),
     CustomError(String),
     Error(String),
+    SdkError(String),
+    BadInput(String),
 }
 
 impl AlternatorError {
     pub fn new(kind: AlternatorErrorKind) -> AlternatorError {
         AlternatorError(kind)
+    }
+
+    pub fn from_sdk_error(err: SdkError<impl Debug + ProvideErrorMetadata, impl Debug>) -> Self {
+        AlternatorError::new(AlternatorErrorKind::SdkError(
+            err.message().unwrap_or("No message").to_string(),
+        ))
     }
 
     pub fn query_retries_exceeded(retry_number: u64) -> AlternatorError {
@@ -47,11 +56,25 @@ impl Display for AlternatorError {
             AlternatorErrorKind::PartitionRowPresetNotFound(s) => {
                 write!(f, "Partition row preset not found: {s}")
             }
+            AlternatorErrorKind::BadInput(s) => write!(f, "BadInput: {s}"),
+            AlternatorErrorKind::SdkError(s) => write!(f, "SdkError: {s}"),
         }
     }
 }
 
 impl std::error::Error for AlternatorError {}
+
+impl From<rune::runtime::AccessError> for AlternatorError {
+    fn from(error: rune::runtime::AccessError) -> Self {
+        AlternatorError::new(AlternatorErrorKind::Error(error.to_string()))
+    }
+}
+
+impl From<aws_sdk_dynamodb::error::BuildError> for AlternatorError {
+    fn from(error: aws_sdk_dynamodb::error::BuildError) -> Self {
+        AlternatorError::new(AlternatorErrorKind::SdkError(error.to_string()))
+    }
+}
 
 pub type DbError = AlternatorError;
 pub type DbErrorKind = AlternatorErrorKind;
