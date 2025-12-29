@@ -97,9 +97,12 @@ fn try_install(
     let mut context_module = init_context_module()?;
     context_module.function_meta(functions::create_table)?;
     context_module.function_meta(functions::delete_table)?;
-    context_module.function_meta(functions::put_item)?;
-    context_module.function_meta(functions::alternator_get_many_validate)?;
-    context_module.function_meta(functions::alternator_count_validate)?;
+    context_module.function_meta(functions::put)?;
+    context_module.function_meta(functions::get)?;
+    context_module.function_meta(functions::delete)?;
+    context_module.function_meta(functions::update)?;
+    context_module.function_meta(functions::query)?;
+
     let err_module = init_error_module()?;
     let uuid_module = init_uuid_module()?;
     let latte_module = init_latte_module(params)?;

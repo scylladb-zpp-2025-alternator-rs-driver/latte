@@ -1,203 +1,334 @@
 use super::alternator_error::{AlternatorError, AlternatorErrorKind};
 use super::context::Context;
-use aws_sdk_dynamodb::types::AttributeValue;
+use super::types::rune_object_to_alternator_map;
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+};
 use rune::runtime::{Object, Ref, Shared};
 use rune::Value;
+use std::collections::HashMap;
 use std::ops::Deref;
 
-fn to_n_attribute_value(v: Value) -> AttributeValue {
-    match v {
-        Value::Integer(i) => AttributeValue::N(i.to_string()),
-        Value::String(s) => AttributeValue::N(s.borrow_ref().unwrap().to_string()),
-        _ => AttributeValue::N(format!("{:?}", v)),
-    }
+fn bad_input<T>(msg: impl Into<String>) -> Result<T, AlternatorError> {
+    Err(AlternatorError::new(AlternatorErrorKind::BadInput(
+        msg.into(),
+    )))
 }
 
-fn get_scalar_type(object: Shared<Object>) -> aws_sdk_dynamodb::types::ScalarAttributeType {
-    if let Some(Value::String(s)) = object.borrow_ref().unwrap().get("type") {
-        match s.borrow_ref().unwrap().as_str() {
-            "N" => aws_sdk_dynamodb::types::ScalarAttributeType::N,
-            "S" => aws_sdk_dynamodb::types::ScalarAttributeType::S,
-            "B" => aws_sdk_dynamodb::types::ScalarAttributeType::B,
-            _ => aws_sdk_dynamodb::types::ScalarAttributeType::S,
+/// Gets the name and type of a primary or sort key from a object.
+fn extract_key_definition(
+    object: &Shared<Object>,
+) -> Result<(String, ScalarAttributeType), AlternatorError> {
+    let key_name = if let Some(Value::String(s)) = object.borrow_ref()?.get("name") {
+        s.borrow_ref()?.to_string()
+    } else {
+        return bad_input("Key definition object must have a 'name' field");
+    };
+
+    let key_type = if let Some(Value::String(t)) = object.borrow_ref()?.get("type") {
+        match t.borrow_ref()?.as_str() {
+            "N" => ScalarAttributeType::N,
+            "S" => ScalarAttributeType::S,
+            "B" => ScalarAttributeType::B,
+            other => return bad_input(format!("Unknown scalar type: {}", other)),
         }
     } else {
-        aws_sdk_dynamodb::types::ScalarAttributeType::S
-    }
+        return bad_input("Key definition object must have a 'type' field");
+    };
+
+    Ok((key_name, key_type))
 }
 
+fn extract_attribute_names(
+    object: &Shared<Object>,
+) -> Result<HashMap<String, String>, AlternatorError> {
+    object
+        .borrow_ref()?
+        .iter()
+        .map(|(k, v)| {
+            Ok((
+                k.to_string(),
+                match v {
+                    Value::String(s) => s.borrow_ref()?.to_string(),
+                    _ => return bad_input("Attribute names must be strings"),
+                },
+            ))
+        })
+        .collect::<Result<_, _>>()
+}
+
+/// Creates a new table.
+///
+/// # Arguments
+/// * `table_name` - The name of the table to create.
+/// * `params` - Table definition parameters. Can be a string (defining just the primary key name) or an object containing:
+///   - `primary_key`: The primary key definition. Can be a string (name) or an object with `name` and `type`.
+///   - `sort_key`: The sort key definition (optional). Can be a string (name) or an object with `name` and `type`.
 #[rune::function(instance)]
 pub async fn create_table(
     ctx: Ref<Context>,
     table_name: Ref<str>,
-    params: Object,
+    params: Value,
 ) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
-    let pk_name = match params.get("primary_key") {
-        Some(Value::String(s)) => s.borrow_ref().unwrap().to_string(),
-        Some(Value::Object(o)) => {
-            if let Some(Value::String(s)) = o.borrow_ref().unwrap().get("name") {
-                s.borrow_ref().unwrap().to_string()
-            } else {
-                "pk".to_string()
-            }
-        }
-        _ => "pk".to_string(),
-    };
-    let pk_type = match params.get("primary_key") {
-        Some(Value::Object(o)) => get_scalar_type(o.clone()),
-        _ => aws_sdk_dynamodb::types::ScalarAttributeType::S,
+
+    // Extract primary key definition
+    let (pk_name, pk_type) = match &params {
+        Value::String(s) => (s.borrow_ref()?.to_string(), ScalarAttributeType::S),
+        Value::Object(o) => match o.borrow_ref()?.get("primary_key") {
+            Some(Value::String(s)) => (s.borrow_ref()?.to_string(), ScalarAttributeType::S),
+            Some(Value::Object(pk_obj)) => extract_key_definition(pk_obj)?,
+            _ => return bad_input("Invalid 'primary_key' object in params"),
+        },
+        _ => return bad_input("Params must be a string or an object"),
     };
 
-    let sk_name = match params.get("sort_key") {
-        Some(Value::String(s)) => s.borrow_ref().unwrap().to_string(),
-        Some(Value::Object(o)) => {
-            if let Some(Value::String(s)) = o.borrow_ref().unwrap().get("name") {
-                s.borrow_ref().unwrap().to_string()
-            } else {
-                "sk".to_string()
-            }
-        }
-        _ => "sk".to_string(),
+    // Extract sort key definition if present
+    let sk = match &params {
+        Value::Object(o) => match o.borrow_ref()?.get("sort_key") {
+            Some(Value::String(s)) => Some((s.borrow_ref()?.to_string(), ScalarAttributeType::S)),
+            Some(Value::Object(sk_obj)) => Some(extract_key_definition(sk_obj)?),
+            Some(_) => return bad_input("Invalid 'sort_key' object in params"),
+            None => None,
+        },
+        _ => None,
     };
 
-    let sk_type = match params.get("sort_key") {
-        Some(Value::Object(o)) => get_scalar_type(o.clone()),
-        _ => aws_sdk_dynamodb::types::ScalarAttributeType::S,
-    };
+    let mut builder = client.create_table().table_name(table_name.deref());
 
-    let pk_schema = aws_sdk_dynamodb::types::KeySchemaElement::builder()
-        .attribute_name(pk_name.clone())
-        .key_type(aws_sdk_dynamodb::types::KeyType::Hash)
-        .build()
-        .unwrap();
+    builder = builder.key_schema(
+        KeySchemaElement::builder()
+            .attribute_name(pk_name.clone())
+            .key_type(KeyType::Hash)
+            .build()?,
+    );
 
-    let sk_schema = aws_sdk_dynamodb::types::KeySchemaElement::builder()
-        .attribute_name(sk_name.clone())
-        .key_type(aws_sdk_dynamodb::types::KeyType::Range)
-        .build()
-        .unwrap();
+    builder = builder.attribute_definitions(
+        AttributeDefinition::builder()
+            .attribute_name(pk_name)
+            .attribute_type(pk_type)
+            .build()?,
+    );
 
-    let pk_def = aws_sdk_dynamodb::types::AttributeDefinition::builder()
-        .attribute_name(pk_name)
-        .attribute_type(pk_type)
-        .build()
-        .unwrap();
+    if let Some((sk_name, sk_type)) = sk {
+        builder = builder.key_schema(
+            KeySchemaElement::builder()
+                .attribute_name(sk_name.clone())
+                .key_type(KeyType::Range)
+                .build()
+                .unwrap(),
+        );
 
-    let sk_def = aws_sdk_dynamodb::types::AttributeDefinition::builder()
-        .attribute_name(sk_name)
-        .attribute_type(sk_type)
-        .build()
-        .unwrap();
+        builder = builder.attribute_definitions(
+            AttributeDefinition::builder()
+                .attribute_name(sk_name)
+                .attribute_type(sk_type)
+                .build()
+                .unwrap(),
+        );
+    }
 
-    client
-        .create_table()
-        .table_name(table_name.deref())
-        .set_key_schema(Some(vec![pk_schema, sk_schema]))
-        .set_attribute_definitions(Some(vec![pk_def, sk_def]))
+    builder
         .billing_mode(aws_sdk_dynamodb::types::BillingMode::PayPerRequest)
         .send()
         .await
-        .map_err(|e| AlternatorError::new(AlternatorErrorKind::Error(e.to_string())))
-        .ok();
+        .map_err(AlternatorError::from_sdk_error)?;
 
     Ok(())
 }
 
+/// Deletes a table.
 #[rune::function(instance)]
 pub async fn delete_table(ctx: Ref<Context>, table_name: Ref<str>) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
+
     client
         .delete_table()
         .table_name(table_name.deref())
         .send()
         .await
-        .map_err(|e| AlternatorError::new(AlternatorErrorKind::Error(e.to_string())))?;
+        .map_err(AlternatorError::from_sdk_error)?;
+
     Ok(())
 }
 
+/// Puts an item into the table.
 #[rune::function(instance)]
-pub async fn put_item(
+pub async fn put(
     ctx: Ref<Context>,
     table_name: Ref<str>,
-    params: Object,
+    item: Ref<Object>,
 ) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
-    let mut builder = client.put_item().table_name(table_name.deref());
-    for (key, value) in params.iter() {
-        let attr_value = to_n_attribute_value(value.clone());
-        builder = builder.item(key.deref(), attr_value);
-    }
-    builder
+    client
+        .put_item()
+        .table_name(table_name.deref())
+        .set_item(Some(rune_object_to_alternator_map(item)?))
         .send()
         .await
-        .map_err(|e| AlternatorError::new(AlternatorErrorKind::Error(e.to_string())))?;
+        .map_err(AlternatorError::from_sdk_error)?;
+
     Ok(())
 }
 
+/// Deletes an item from the table.
 #[rune::function(instance)]
-pub async fn alternator_get_many_validate(
+pub async fn delete(
     ctx: Ref<Context>,
     table_name: Ref<str>,
-    pk: Value,
-    max_limit: Value,
-    expected_rows_num: u64,
-) -> Result<Vec<String>, AlternatorError> {
+    key: Ref<Object>,
+) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
-    let limit = match max_limit {
-        Value::Integer(i) => i as i32,
-        Value::String(s) => s.borrow_ref().unwrap().parse::<i32>().unwrap(),
-        _ => 1,
-    };
-
-    let result = client
-        .query()
+    client
+        .delete_item()
         .table_name(table_name.deref())
-        .key_condition_expression("pk = :pk")
-        .expression_attribute_values(":pk", to_n_attribute_value(pk))
-        .limit(limit)
+        .set_key(Some(rune_object_to_alternator_map(key)?))
         .send()
         .await
-        .map_err(|e| AlternatorError::new(AlternatorErrorKind::Error(e.to_string())))?;
+        .map_err(AlternatorError::from_sdk_error)?;
 
-    if let Some(items) = result.items {
-        let output: Vec<String> = items
-            .iter()
-            .filter_map(|item| {
-                if let Some(AttributeValue::N(ck)) = item.get("ck") {
-                    Some(ck.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(output.len() as u64 == expected_rows_num);
-        return Ok(output);
-    }
-    Ok(vec![])
+    Ok(())
 }
 
+/// Gets an item from the table.
+///
+/// # Arguments
+/// * `table_name` - The name of the table.
+/// * `key` - The primary key of the item to get. Must be an object.
+/// * `options` - Optional parameters object.
+///   - `consistent_read`: Boolean to enable consistent read.
 #[rune::function(instance)]
-pub async fn alternator_count_validate(
+pub async fn get(
     ctx: Ref<Context>,
     table_name: Ref<str>,
-    pk: Value,
-    expected_rows_num: u64,
-) -> Result<i64, AlternatorError> {
+    key: Ref<Object>,
+    options: Option<Ref<Object>>,
+) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
-    let result = client
-        .query()
+    let mut builder = client
+        .get_item()
         .table_name(table_name.deref())
-        .key_condition_expression("pk = :pk")
-        .expression_attribute_values(":pk", to_n_attribute_value(pk))
-        .select(aws_sdk_dynamodb::types::Select::Count)
+        .set_key(Some(rune_object_to_alternator_map(key)?));
+
+    if let Some(options) = options {
+        if let Some(Value::Bool(consistent_read)) = options.get("consistent_read") {
+            builder = builder.consistent_read(*consistent_read);
+        }
+    }
+
+    builder
         .send()
         .await
-        .map_err(|e| AlternatorError::new(AlternatorErrorKind::Error(e.to_string())))?;
+        .map_err(AlternatorError::from_sdk_error)?;
 
-    assert!(result.count as u64 == expected_rows_num);
-    Ok(result.count as i64)
+    Ok(())
+}
+
+/// Updates an item in the table.
+///
+/// # Arguments
+/// * `table_name` - The name of the table.
+/// * `key` - The primary key of the item to update. Must be an object.
+/// * `update_params` - Parameters for the update operation. Must be an object containing:
+///   - `update`: The update expression string.
+///   - `attribute-names`: A map of attribute name placeholders to actual names.
+///   - `attribute-values`: A map of attribute value placeholders to values.
+#[rune::function(instance)]
+pub async fn update(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    key: Ref<Object>,
+    params: Ref<Object>,
+) -> Result<(), AlternatorError> {
+    let client = ctx.client.as_ref().unwrap();
+
+    let mut builder = client
+        .update_item()
+        .table_name(table_name.deref())
+        .set_key(Some(rune_object_to_alternator_map(key)?));
+
+    if let Some(Value::String(update_expression)) = params.get("update") {
+        builder = builder.update_expression(update_expression.borrow_ref()?.to_string());
+    }
+
+    if let Some(Value::Object(attr_names)) = params.get("attribute-names") {
+        builder =
+            builder.set_expression_attribute_names(Some(extract_attribute_names(attr_names)?));
+    }
+
+    if let Some(Value::Object(attr_values)) = params.get("attribute-values") {
+        builder = builder.set_expression_attribute_values(Some(rune_object_to_alternator_map(
+            attr_values.clone().into_ref()?,
+        )?));
+    }
+
+    builder
+        .send()
+        .await
+        .map_err(AlternatorError::from_sdk_error)?;
+
+    Ok(())
+}
+
+/// Queries items from the table.
+///
+/// # Arguments
+/// * `table_name` - The name of the table.
+/// * `query_params` - Parameters for the query operation. Must be an object containing:
+///   - `query`: The key condition expression string.
+///   - `filter`: The filter expression string.
+///   - `attribute-names`: A map of attribute name placeholders to actual names.
+///   - `attribute-values`: A map of attribute value placeholders to values.
+///   - `consistent_read`: Boolean to enable consistent read.
+///   - `limit`: The maximum number of items to evaluate.
+#[rune::function(instance)]
+pub async fn query(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    params: Ref<Object>,
+) -> Result<(), AlternatorError> {
+    let client = ctx.client.as_ref().unwrap();
+
+    let mut builder = client.query().table_name(table_name.deref());
+
+    if let Some(Value::String(key_condition_expression)) = params.get("query") {
+        builder =
+            builder.key_condition_expression(key_condition_expression.borrow_ref()?.to_string());
+    }
+
+    if let Some(Value::String(filter_expression)) = params.get("filter") {
+        builder = builder.filter_expression(filter_expression.borrow_ref()?.to_string());
+    }
+
+    if let Some(Value::Object(attr_names)) = params.get("attribute-names") {
+        builder =
+            builder.set_expression_attribute_names(Some(extract_attribute_names(attr_names)?));
+    }
+
+    if let Some(Value::Object(attr_values)) = params.get("attribute-values") {
+        builder = builder.set_expression_attribute_values(Some(rune_object_to_alternator_map(
+            attr_values.clone().into_ref()?,
+        )?));
+    }
+
+    if let Some(Value::Bool(consistent_read)) = params.get("consistent_read") {
+        builder = builder.consistent_read(*consistent_read);
+    }
+
+    if let Some(limit_val) = params.get("limit") {
+        builder = builder.limit(match limit_val {
+            Value::Integer(i) => *i as i32,
+            _ => return bad_input("limit must be an integer"),
+        });
+    }
+
+    builder
+        .send()
+        .await
+        .map_err(AlternatorError::from_sdk_error)?;
+
+    Ok(())
 }
