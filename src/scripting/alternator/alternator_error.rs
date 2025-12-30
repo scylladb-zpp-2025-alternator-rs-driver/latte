@@ -1,6 +1,6 @@
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use rune::alloc::fmt::TryWrite;
-use rune::runtime::VmResult;
+use rune::runtime::{VmError, VmResult};
 use rune::{vm_write, Any};
 use std::fmt::{Debug, Display, Formatter};
 
@@ -18,6 +18,7 @@ pub enum AlternatorErrorKind {
     SdkError(String),
     BadInput(String),
     ValidationError(String),
+    ConversionError(String),
 }
 
 impl AlternatorError {
@@ -60,6 +61,7 @@ impl Display for AlternatorError {
             AlternatorErrorKind::BadInput(s) => write!(f, "BadInput: {s}"),
             AlternatorErrorKind::SdkError(s) => write!(f, "SdkError: {s}"),
             AlternatorErrorKind::ValidationError(s) => write!(f, "ValidationError: {s}"),
+            AlternatorErrorKind::ConversionError(s) => write!(f, "ConversionError: {s}"),
         }
     }
 }
@@ -75,6 +77,18 @@ impl From<rune::runtime::AccessError> for AlternatorError {
 impl From<aws_sdk_dynamodb::error::BuildError> for AlternatorError {
     fn from(error: aws_sdk_dynamodb::error::BuildError) -> Self {
         AlternatorError::new(AlternatorErrorKind::SdkError(error.to_string()))
+    }
+}
+
+impl From<VmError> for AlternatorError {
+    fn from(error: VmError) -> Self {
+        AlternatorError::new(AlternatorErrorKind::ConversionError(error.to_string()))
+    }
+}
+
+impl From<rune::alloc::Error> for AlternatorError {
+    fn from(error: rune::alloc::Error) -> Self {
+        AlternatorError::new(AlternatorErrorKind::ConversionError(error.to_string()))
     }
 }
 

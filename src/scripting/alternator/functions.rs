@@ -2,12 +2,12 @@ use crate::scripting::functions_common::{extract_validation_args, ValidationArgs
 
 use super::alternator_error::{AlternatorError, AlternatorErrorKind};
 use super::context::Context;
-use super::types::rune_object_to_alternator_map;
+use super::types::{alternator_map_to_rune_object, rune_object_to_alternator_map};
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
 };
 use rune::runtime::{Object, Ref, Shared};
-use rune::Value;
+use rune::{ToValue, Value};
 use std::collections::HashMap;
 use std::ops::Deref;
 
@@ -208,6 +208,30 @@ pub async fn get(
     key: Ref<Object>,
     options: Option<Ref<Object>>,
 ) -> Result<(), AlternatorError> {
+    _get(ctx, table_name, key, options, false).await.map(|_| ())
+}
+
+/// Like `get`, but returns the result item.
+///
+/// # Returns
+/// Some(item) if the item was found, or None.
+#[rune::function(instance)]
+pub async fn get_with_result(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    key: Ref<Object>,
+    options: Option<Ref<Object>>,
+) -> Result<Option<Value>, AlternatorError> {
+    _get(ctx, table_name, key, options, true).await
+}
+
+async fn _get(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    key: Ref<Object>,
+    options: Option<Ref<Object>>,
+    return_result: bool,
+) -> Result<Option<Value>, AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
     let mut builder = client
@@ -221,12 +245,16 @@ pub async fn get(
         }
     }
 
-    builder
+    let output = builder
         .send()
         .await
         .map_err(AlternatorError::from_sdk_error)?;
 
-    Ok(())
+    if return_result {
+        output.item.map(alternator_map_to_rune_object).transpose()
+    } else {
+        Ok(None)
+    }
 }
 
 /// Updates an item in the table.
@@ -292,7 +320,9 @@ pub async fn query(
     table_name: Ref<str>,
     params: Ref<Object>,
 ) -> Result<(), AlternatorError> {
-    _query(ctx, table_name, params, None).await
+    _query(ctx, table_name, params, None, false)
+        .await
+        .map(|_| ())
 }
 
 /// Like `query`, but with validation support.
@@ -311,8 +341,23 @@ pub async fn query_with_validation(
             extract_validation_args(validation_args)
                 .map_err(|s| AlternatorError::new(AlternatorErrorKind::BadInput(s)))?,
         ),
+        false,
     )
     .await
+    .map(|_| ())
+}
+
+/// Like `query`, but returns the result items.
+///
+/// # Returns
+/// A list of items matching the query.
+#[rune::function(instance)]
+pub async fn query_with_result(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    params: Ref<Object>,
+) -> Result<Value, AlternatorError> {
+    _query(ctx, table_name, params, None, true).await
 }
 
 async fn _query(
@@ -320,7 +365,8 @@ async fn _query(
     table_name: Ref<str>,
     params: Ref<Object>,
     validation: Option<ValidationArgs>,
-) -> Result<(), AlternatorError> {
+    return_result: bool,
+) -> Result<Value, AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
     let mut builder = client.query().table_name(table_name.deref());
@@ -374,5 +420,16 @@ async fn _query(
         }
     }
 
-    Ok(())
+    if return_result {
+        Ok(output
+            .items
+            .unwrap_or_default()
+            .into_iter()
+            .map(alternator_map_to_rune_object)
+            .collect::<Result<Vec<_>, _>>()?
+            .to_value()
+            .into_result()?)
+    } else {
+        Ok(Value::EmptyTuple)
+    }
 }

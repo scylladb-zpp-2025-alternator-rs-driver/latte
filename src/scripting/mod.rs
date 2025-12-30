@@ -99,9 +99,11 @@ fn try_install(
     context_module.function_meta(functions::delete_table)?;
     context_module.function_meta(functions::put)?;
     context_module.function_meta(functions::get)?;
+    context_module.function_meta(functions::get_with_result)?;
     context_module.function_meta(functions::delete)?;
     context_module.function_meta(functions::update)?;
     context_module.function_meta(functions::query)?;
+    context_module.function_meta(functions::query_with_result)?;
     context_module.function_meta(functions::query_with_validation)?;
 
     let err_module = init_error_module()?;
