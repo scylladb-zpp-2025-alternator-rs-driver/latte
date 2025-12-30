@@ -1,3 +1,5 @@
+use crate::scripting::functions_common::{extract_validation_args, ValidationArgs};
+
 use super::alternator_error::{AlternatorError, AlternatorErrorKind};
 use super::context::Context;
 use super::types::rune_object_to_alternator_map;
@@ -290,6 +292,35 @@ pub async fn query(
     table_name: Ref<str>,
     params: Ref<Object>,
 ) -> Result<(), AlternatorError> {
+    _query(ctx, table_name, params, None).await
+}
+
+/// Like `query`, but with validation support.
+#[rune::function(instance)]
+pub async fn query_with_validation(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    params: Ref<Object>,
+    validation_args: Vec<Value>,
+) -> Result<(), AlternatorError> {
+    _query(
+        ctx,
+        table_name,
+        params,
+        Some(
+            extract_validation_args(validation_args)
+                .map_err(|s| AlternatorError::new(AlternatorErrorKind::BadInput(s)))?,
+        ),
+    )
+    .await
+}
+
+async fn _query(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    params: Ref<Object>,
+    validation: Option<ValidationArgs>,
+) -> Result<(), AlternatorError> {
     let client = ctx.client.as_ref().unwrap();
 
     let mut builder = client.query().table_name(table_name.deref());
@@ -325,10 +356,23 @@ pub async fn query(
         });
     }
 
-    builder
+    let output = builder
         .send()
         .await
         .map_err(AlternatorError::from_sdk_error)?;
+
+    if let Some(validation) = validation {
+        let item_count = output.items().len() as u64;
+
+        if item_count < validation.expected_min || item_count > validation.expected_max {
+            return Err(AlternatorError::new(AlternatorErrorKind::ValidationError(
+                format!(
+                    "Query returned {item_count} items, expected between {} and {} {}",
+                    validation.expected_min, validation.expected_max, validation.custom_err_msg
+                ),
+            )));
+        }
+    }
 
     Ok(())
 }

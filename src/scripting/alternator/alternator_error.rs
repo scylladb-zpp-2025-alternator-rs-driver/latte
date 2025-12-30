@@ -17,6 +17,7 @@ pub enum AlternatorErrorKind {
     Error(String),
     SdkError(String),
     BadInput(String),
+    ValidationError(String),
 }
 
 impl AlternatorError {
@@ -58,6 +59,7 @@ impl Display for AlternatorError {
             }
             AlternatorErrorKind::BadInput(s) => write!(f, "BadInput: {s}"),
             AlternatorErrorKind::SdkError(s) => write!(f, "SdkError: {s}"),
+            AlternatorErrorKind::ValidationError(s) => write!(f, "ValidationError: {s}"),
         }
     }
 }

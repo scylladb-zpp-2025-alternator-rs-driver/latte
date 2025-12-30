@@ -102,6 +102,7 @@ fn try_install(
     context_module.function_meta(functions::delete)?;
     context_module.function_meta(functions::update)?;
     context_module.function_meta(functions::query)?;
+    context_module.function_meta(functions::query_with_validation)?;
 
     let err_module = init_error_module()?;
     let uuid_module = init_uuid_module()?;
