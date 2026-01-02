@@ -19,7 +19,7 @@ pub async fn connect(conf: &ConnectionConf) -> Result<Context, AlternatorError> 
 
     // Validate connection by making a test request
     client.list_tables().limit(1).send().await.map_err(|e| {
-        let addr = conf.addresses.get(0).cloned().unwrap_or_default();
+        let addr = conf.addresses.first().cloned().unwrap_or_default();
         AlternatorError(AlternatorErrorKind::FailedToConnect(
             addr,
             DisplayErrorContext(&e).to_string(),
