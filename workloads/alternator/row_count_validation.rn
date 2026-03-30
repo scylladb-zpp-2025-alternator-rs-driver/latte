@@ -16,6 +16,7 @@ const PARTITION_SIZES = latte::param!("partition_sizes", "50:4,50:6");
 const TABLE = "row_count_validation_table";
 
 pub async fn schema(db) {
+    // Drop the table (ignoring errors if it doesn't exist) to ensure we always have the up-to-date schema.
     db.delete_table(TABLE).await;
     db.create_table(TABLE, #{primary_key: #{name: "pk", type: "N"}, sort_key: #{name: "ck", type: "N"}}).await?;
 }
