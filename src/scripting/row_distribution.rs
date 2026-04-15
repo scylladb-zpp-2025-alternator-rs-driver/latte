@@ -509,7 +509,7 @@ mod tests {
         )
     }
 
-    #[cfg(feature = "alternator")]
+    #[cfg(any(feature = "alternator", feature="alternator-new"))]
     fn create_test_context() -> Context {
         Context::new(
             None, 0,

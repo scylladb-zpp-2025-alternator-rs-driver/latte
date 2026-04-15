@@ -47,6 +47,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "alternator-driver"
+version = "0.1.0"
+source = "git+https://github.com/scylladb/alternator-rust-driver.git#ded8d206c7ebe105529d5c6011c4aade68f4020f"
+dependencies = [
+ "anyhow",
+ "aws-runtime",
+ "aws-sdk-dynamodb",
+ "aws-smithy-async",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "flate2",
+ "http-body-util",
+ "itertools 0.14.0",
+ "reqwest",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2181,6 +2200,7 @@ dependencies = [
 name = "latte-cli"
 version = "0.45.0-scylladb"
 dependencies = [
+ "alternator-driver",
  "anyhow",
  "assert_approx_eq",
  "aws-config",
