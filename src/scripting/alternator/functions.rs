@@ -1,15 +1,18 @@
 use crate::config::ValidationStrategy;
-use crate::scripting::alternator::traits::{AlternatorRequest, IntoAlternatorOutput};
+use crate::scripting::alternator::traits::{
+    AlternatorRequest, IntoAlternatorOutput, PaginationToken,
+};
 use crate::scripting::functions_common::{extract_validation_args, ValidationArgs};
 use crate::scripting::retry_error::handle_retry_error;
 
 use super::alternator_error::{AlternatorError, AlternatorErrorKind};
 use super::context::Context;
-use super::types::rune_object_to_alternator_map;
+use super::types::{alternator_map_to_rune_object, rune_object_to_alternator_map};
 use super::types::{BSET_KEY, NSET_KEY, SSET_KEY};
 use aws_sdk_dynamodb::client::Waiters;
 use aws_sdk_dynamodb::types::{
-    AttributeDefinition, KeySchemaElement, KeyType, ScalarAttributeType,
+    AttributeDefinition, DeleteRequest, KeySchemaElement, KeyType, KeysAndAttributes, PutRequest,
+    ScalarAttributeType, WriteRequest,
 };
 use rune::runtime::{Object, Ref, Shared, VmResult};
 use rune::{ToValue, Value};
@@ -72,11 +75,12 @@ fn extract_attribute_names(
         .collect::<Result<_, _>>()
 }
 
-async fn handle_request(
+async fn handle_request_with_pagination(
     ctx: &Context,
     builder: impl AlternatorRequest,
-) -> Result<Vec<Value>, AlternatorError> {
-    let mut token: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+    auto_paginate: bool,
+) -> Result<(Vec<Value>, Option<PaginationToken>), AlternatorError> {
+    let mut token: Option<PaginationToken> = None;
     let mut current_attempt_num = 0;
     let mut all_pages_duration = Duration::ZERO;
     let mut all_items = Vec::new();
@@ -110,20 +114,28 @@ async fn handle_request(
                             .try_lock()
                             .unwrap()
                             .complete_request(all_pages_duration, total_item_count);
-                        return Ok(all_items);
+                        return Ok((all_items, token));
                     }
                 }
 
                 if token.is_some() && builder.has_pagination() {
-                    current_attempt_num = 0; // reset retries for next page
-                    continue;
+                    if auto_paginate {
+                        current_attempt_num = 0; // reset retries for next page
+                        continue;
+                    } else {
+                        ctx.stats
+                            .try_lock()
+                            .unwrap()
+                            .complete_request(all_pages_duration, total_item_count);
+                        return Ok((all_items, token));
+                    }
                 }
 
                 ctx.stats
                     .try_lock()
                     .unwrap()
                     .complete_request(all_pages_duration, total_item_count);
-                return Ok(all_items);
+                return Ok((all_items, token));
             }
             Err(e) => {
                 let current_error = e;
@@ -136,6 +148,13 @@ async fn handle_request(
     Err(AlternatorError::query_retries_exceeded(ctx.retry_number))
 }
 
+async fn handle_request(
+    ctx: &Context,
+    builder: impl AlternatorRequest,
+) -> Result<Vec<Value>, AlternatorError> {
+    Ok(handle_request_with_pagination(ctx, builder, true).await?.0)
+}
+
 async fn handle_request_with_validation(
     ctx: &Context,
     builder: impl AlternatorRequest,
@@ -144,7 +163,7 @@ async fn handle_request_with_validation(
 ) -> Result<Vec<Value>, AlternatorError> {
     let mut current_attempt_num: u64 = 0;
     loop {
-        let result = handle_request(ctx, builder.clone()).await?;
+        let (result, _) = handle_request_with_pagination(ctx, builder.clone(), true).await?;
 
         let validation = match validation {
             None => return Ok(result),
@@ -178,6 +197,86 @@ async fn handle_request_with_validation(
             }
         }
     }
+}
+
+fn format_batch_result(
+    items: Vec<Value>,
+    token: Option<PaginationToken>,
+    auto_paginate: bool,
+    with_result: bool,
+    table_name: &str,
+) -> Result<Value, AlternatorError> {
+    if !with_result {
+        return Ok(Value::EmptyTuple);
+    }
+
+    if auto_paginate {
+        return Ok(items.to_value().into_result()?);
+    }
+
+    let mut res_obj = rune::runtime::Object::new();
+
+    res_obj.insert(
+        rune::alloc::String::try_from("items")?,
+        items.to_value().into_result()?,
+    )?;
+
+    match token {
+        Some(PaginationToken::UnprocessedKeys(mut u_keys)) => {
+            let keys: Vec<Value> = u_keys
+                .remove(table_name)
+                .map(|k| k.keys)
+                .unwrap_or_default()
+                .into_iter()
+                .map(alternator_map_to_rune_object)
+                .collect::<Result<_, _>>()?;
+
+            res_obj.insert(
+                rune::alloc::String::try_from("unprocessed_keys")?,
+                keys.to_value().into_result()?,
+            )?;
+        }
+        Some(PaginationToken::UnprocessedItems(mut u_items)) => {
+            let requests: Vec<Value> = u_items
+                .remove(table_name)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|req| {
+                    let mut o = rune::runtime::Object::new();
+
+                    if let Some(put) = req.put_request {
+                        o.insert(
+                            rune::alloc::String::try_from("type")?,
+                            "put".to_value().into_result()?,
+                        )?;
+                        o.insert(
+                            rune::alloc::String::try_from("item")?,
+                            alternator_map_to_rune_object(put.item)?,
+                        )?;
+                    } else if let Some(del) = req.delete_request {
+                        o.insert(
+                            rune::alloc::String::try_from("type")?,
+                            "delete".to_value().into_result()?,
+                        )?;
+                        o.insert(
+                            rune::alloc::String::try_from("key")?,
+                            alternator_map_to_rune_object(del.key)?,
+                        )?;
+                    }
+
+                    Ok(Value::Object(Shared::new(o)?))
+                })
+                .collect::<Result<_, AlternatorError>>()?;
+
+            res_obj.insert(
+                rune::alloc::String::try_from("unprocessed_items")?,
+                requests.to_value().into_result()?,
+            )?;
+        }
+        _ => {}
+    }
+
+    Ok(Value::Object(Shared::new(res_obj)?))
 }
 
 /// Creates a new table.
@@ -413,6 +512,159 @@ pub async fn update(
     handle_request(&ctx, builder).await?;
 
     Ok(())
+}
+
+/// Batch retrieves items from the table.
+///
+/// If `with_result` is set to true, the retrieved items are returned as a `Vec<Object>`.
+/// Otherwise, the unit value is returned.
+///
+/// # Arguments
+/// * `table_name` - The name of the table.
+/// * `keys` - A list of items, where each item is an object representing a primary key.
+/// * `options` - Optional parameters. An object containing:
+///   - `consistent_read`: Boolean to enable consistent read for all keys (default: false).
+///   - `with_result`: If true, the retrieved items are returned (default: false).
+///   - `get_unprocessed`: If true, disables auto-pagination. When `with_result: true` returns an object with `items` and `unprocessed_keys`.
+#[rune::function(instance)]
+pub async fn batch_get_item(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    keys: Ref<rune::runtime::Vec>,
+    options: Value,
+) -> Result<Value, AlternatorError> {
+    let client = ctx.get_client()?;
+
+    // Convert keys vector to DynamoDB keys
+    let keys_list = keys
+        .iter()
+        .map(|key_val| match key_val {
+            Value::Object(key_obj) => rune_object_to_alternator_map(key_obj.clone().into_ref()?),
+            _ => bad_input("Each key in the keys list must be an object"),
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut with_result = false;
+    let mut get_unprocessed = false;
+
+    // BatchGetItem requires the keys to be wrapped in a KeysAndAttributes struct
+    let mut keys_request_builder = KeysAndAttributes::builder().set_keys(Some(keys_list));
+    if let Value::Object(opts) = &options {
+        let opts_ref = opts.borrow_ref()?;
+        if let Some(Value::Bool(consistent_read)) = opts_ref.get("consistent_read") {
+            keys_request_builder = keys_request_builder.consistent_read(*consistent_read);
+        }
+        if let Some(Value::Bool(w)) = opts_ref.get("with_result") {
+            with_result = *w;
+        }
+        if let Some(Value::Bool(u)) = opts_ref.get("get_unprocessed") {
+            get_unprocessed = *u;
+        }
+    }
+
+    let builder = client
+        .batch_get_item()
+        .request_items(table_name.deref(), keys_request_builder.build()?);
+
+    let (result_items, token) =
+        handle_request_with_pagination(&ctx, builder, !get_unprocessed).await?;
+
+    format_batch_result(
+        result_items,
+        token,
+        !get_unprocessed,
+        with_result,
+        table_name.deref(),
+    )
+}
+
+/// Batch writes items to the table.
+///
+/// # Arguments
+/// * `table_name` - The name of the table.
+/// * `write_requests` - A list of write requests. Each request is an object containing:
+///   - `type`: Either "put" or "delete".
+///   - `item`: For put requests, the item object to insert.
+///   - `key`: For delete requests, the key object to delete.
+/// * `options` - Optional parameters. An object containing:
+///   - `get_unprocessed`: If true, disables auto-pagination. Returns an object with `unprocessed_items`.
+#[rune::function(instance)]
+pub async fn batch_write_item(
+    ctx: Ref<Context>,
+    table_name: Ref<str>,
+    write_requests: Ref<rune::runtime::Vec>,
+    options: Value,
+) -> Result<Value, AlternatorError> {
+    let client = ctx.get_client()?;
+
+    let writes = write_requests
+        .iter()
+        .map(|req_val| {
+            let Value::Object(req_obj) = req_val else {
+                return bad_input("Each write request must be an object");
+            };
+
+            let req_ref = req_obj.borrow_ref()?;
+
+            let req_type = match req_ref.get("type") {
+                Some(Value::String(t)) => t.borrow_ref()?.to_string(),
+                _ => return bad_input("Write request must have a 'type' field (put or delete)"),
+            };
+
+            match req_type.as_str() {
+                "put" => {
+                    let Some(Value::Object(item)) = req_ref.get("item") else {
+                        return bad_input("Put request must have an 'item' field");
+                    };
+
+                    let item_map = rune_object_to_alternator_map(item.clone().into_ref()?)?;
+
+                    Ok(WriteRequest::builder()
+                        .put_request(PutRequest::builder().set_item(Some(item_map)).build()?)
+                        .build())
+                }
+                "delete" => {
+                    let Some(Value::Object(key)) = req_ref.get("key") else {
+                        return bad_input("Delete request must have a 'key' field");
+                    };
+
+                    let key_map = rune_object_to_alternator_map(key.clone().into_ref()?)?;
+
+                    Ok(WriteRequest::builder()
+                        .delete_request(DeleteRequest::builder().set_key(Some(key_map)).build()?)
+                        .build())
+                }
+                _ => bad_input(format!(
+                    "Invalid request type: {}, must be 'put' or 'delete'",
+                    req_type
+                )),
+            }
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut get_unprocessed = false;
+
+    if let Value::Object(opts) = &options {
+        let opts_ref = opts.borrow_ref()?;
+        if let Some(Value::Bool(x)) = opts_ref.get("get_unprocessed") {
+            get_unprocessed = *x;
+        }
+    }
+
+    let builder = client
+        .batch_write_item()
+        .request_items(table_name.deref(), writes);
+
+    let (result_items, token) =
+        handle_request_with_pagination(&ctx, builder, !get_unprocessed).await?;
+
+    format_batch_result(
+        result_items,
+        token,
+        !get_unprocessed,
+        get_unprocessed,
+        table_name.deref(),
+    )
 }
 
 /// Queries items from the table.
