@@ -1,0 +1,15 @@
+# Develop commits already backported to main (orig + fixup SHAs).
+# Maintained via: dev-commits.sh --mark-backported <sha> ...
+# Check candidates: dev-commits.sh --check-backported
+043f65858b372cc06c0bd90b081354d583be12e0  # Add performance test for `with_result`.
+5098a6eca5dfdb1806918b88375f613425ac8aca  # fixup! Add performance test for `with_result`.
+5dfa7b5b14e190937ec8101aad1cabc48f541222  # fixup! Add performance test for `with_result`.
+e193cc85ca2a722ee5a8c019186187ad782bcbad  # Add result extraction to alternator query and get function.
+bab312a57ff81eeec1b72f1c9c6ad26530524e5a  # Add count validation to alternator query function.
+78a2c10ff69fc3cf7588f52cbab2e2e42f6e51a7  # fixup! Add count validation to alternator query function.
+c2e2feacda648866aa62d4f43479381377f2727a  # fixup! Add count validation to alternator query function.
+a003478fc683ac1d2db337682781d5f5b26a6d9a  # Add rune alternator api functions.
+f20ae043ab63bb32d5ae76e3c65150ad6af29a07  # fixup! Add rune alternator api functions.
+29e1a5dab8b9de70fb625dd3d0bd374166702924  # fixup! Add rune alternator api functions.
+bee43826dc564709a4ae92098ce77f5e8badd6ba  # Move validation args parsing logic to common functions.
+81c4dadcf067b04d71e749a24497ff23ac9af653  # fixup! Move validation args parsing logic to common functions.

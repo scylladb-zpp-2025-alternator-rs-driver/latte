@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Show commits in develop that are not in main, accounting for main→develop merges.
-# Usage: dev-commits.sh [--list|--merges|--graph|--ordered|--backport-plan]
-#   --list          (default) flat list of non-merge, non-fork commits
-#   --merges        list of merge commits that bring in develop-only work
-#   --graph         combined graph showing branch structure
-#   --ordered       ordered list of SHAs oldest→newest (used by backport.sh)
-#   --backport-plan ordered units oldest→newest, one unit per line:
-#                     <orig-sha> [fixup-sha1] [fixup-sha2] ...
-#                   Units already covered (by cherry-picked trailer or patch-id)
-#                   are omitted.
+# Usage: dev-commits.sh [--list|--merges|--graph|--ordered|--backport-plan|--check-backported|--mark-backported]
+#   --list              (default) flat list of non-merge, non-fork commits
+#   --merges            list of merge commits that bring in develop-only work
+#   --graph             combined graph showing branch structure
+#   --ordered           ordered list of SHAs oldest→newest (used by backport.sh)
+#   --backport-plan     ordered units oldest→newest, one unit per line:
+#                         <orig-sha> [fixup-sha1] [fixup-sha2] ...
+#                       Units already covered (by cherry-picked trailer or patch-id)
+#                       are omitted.
+#   --check-backported  heuristic: show commits that may already be on main
+#                       (matched by subject). Human reviews, then uses --mark-backported.
+#   --mark-backported <sha> ...
+#                       Add develop SHAs to .fork/backported-shas (with fixups).
+#   --mark-all-checked  Mark all --check-backported candidates as backported.
+#   --pr-message        Generate a PR description from the backport plan merge commits.
 #
 # Fixup commits use the native git format (subject prefix):
 #   fixup! <target subject>   squash into target, keep target's message
@@ -32,10 +38,27 @@ _has_fixup_trailer() {
 
 # Compute develop-only commits by patch-id (handles main→develop merge duplicates).
 # Output: full SHAs, one per line.
-# Excludes: "fork:" subject commits, and fixup!/amend! commits.
+# Excludes: "fork:" subject commits, fixup!/amend! commits, and commits listed
+# in .fork/backported-shas.
 good_full() {
   local main_pids
   main_pids=$(git log -p main --no-merges | git patch-id --stable | awk '{print $1}')
+
+  # Load backported-shas exclusion set
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  declare -A backported=()
+  if [[ -f "$script_dir/backported-shas" ]]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"           # strip comments
+      line="${line// /}"           # strip spaces
+      [[ -z "$line" ]] && continue
+      # resolve short SHA to full
+      local full
+      full=$(git rev-parse --verify "$line^{commit}" 2>/dev/null) || continue
+      backported[$full]=1
+    done < "$script_dir/backported-shas"
+  fi
 
   git log -p develop --not main --no-merges | git patch-id --stable \
   | awk -v mpids="$main_pids" '
@@ -46,7 +69,9 @@ good_full() {
   | grep -v " fork:" \
   | awk '{print $1}' \
   | while IFS= read -r sha; do
-      _has_fixup_trailer "$sha" || echo "$sha"
+      _has_fixup_trailer "$sha" && continue
+      [[ -n "${backported[$sha]+_}" ]] && continue
+      echo "$sha"
     done
 }
 
@@ -287,15 +312,160 @@ case "$mode" in
           echo "~$orig_sha $uncovered_fixups"
           continue
         fi
-        # Case 3: neither covered → orig not on backport yet → full unit (orig + fixups).
+        # Case 3: neither covered → not yet backported, emit full unit.
       fi
 
       echo "$orig_sha${fixups_str:+ $fixups_str}"
     done < <(iter_ordered "$backport_branch" "$base")
     ;;
 
+  --check-backported)
+    # Heuristic: for each commit in --list output, check if main has a commit
+    # with the same subject. Output candidates for human review.
+    # Excludes commits already in backported-shas.
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    declare -A _chk_backported=()
+    if [[ -f "$script_dir/backported-shas" ]]; then
+      while IFS= read -r line; do
+        line="${line%%#*}"; line="${line// /}"
+        [[ -z "$line" ]] && continue
+        full=$(git rev-parse --verify "$line^{commit}" 2>/dev/null) || continue
+        _chk_backported[$full]=1
+      done < "$script_dir/backported-shas"
+    fi
+
+    declare -A main_subjects=()
+    while IFS=$'\t' read -r sha subj; do
+      main_subjects[$subj]="$sha"
+    done < <(git log main --no-merges --format="%h%x09%s")
+
+    while IFS= read -r dev_sha; do
+      subj=$(git log --no-walk --format="%s" "$dev_sha")
+      if [[ -n "${main_subjects[$subj]+_}" ]]; then
+        echo "$dev_sha ${main_subjects[$subj]} $subj"
+      fi
+    done < <(good_full)
+
+    # Also check fixup/amend commits whose target subject matches main
+    while IFS=" " read -r target_full fixup_full; do
+      [[ -n "${_chk_backported[$fixup_full]+_}" ]] && continue
+      subj=$(git log --no-walk --format="%s" "$target_full")
+      if [[ -n "${main_subjects[$subj]+_}" ]]; then
+        fixup_subj=$(git log --no-walk --format="%s" "$fixup_full")
+        echo "$fixup_full (fixup for $target_full) $fixup_subj"
+      fi
+    done < <(fixup_map)
+    ;;
+
+  --mark-all-checked)
+    # Convenience: mark all --check-backported candidates as backported.
+    mapfile -t _shas < <(bash "${BASH_SOURCE[0]}" --check-backported | awk '{print $1}')
+    if (( ${#_shas[@]} == 0 )); then
+      echo "Nothing to mark."
+    else
+      bash "${BASH_SOURCE[0]}" --mark-backported "${_shas[@]}"
+    fi
+    ;;
+
+  --mark-backported)
+    shift
+    if (( $# == 0 )); then
+      echo "Usage: $0 --mark-backported <sha1> [sha2] ..." >&2
+      exit 1
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    backported_file="$script_dir/backported-shas"
+    touch "$backported_file"
+
+    # Load existing entries to avoid duplicates
+    declare -A existing=()
+    while IFS= read -r line; do
+      l="${line%%#*}"; l="${l// /}"
+      [[ -z "$l" ]] && continue
+      full=$(git rev-parse --verify "$l^{commit}" 2>/dev/null) || continue
+      existing[$full]=1
+    done < "$backported_file"
+
+    # Build fixup map for lookup
+    declare -A _mark_fmap=()
+    while IFS=" " read -r target_full fixup_full; do
+      if [[ -n "${_mark_fmap[$target_full]+_}" ]]; then
+        _mark_fmap[$target_full]+=" $fixup_full"
+      else
+        _mark_fmap[$target_full]="$fixup_full"
+      fi
+    done < <(fixup_map)
+
+    added=0
+    for sha in "$@"; do
+      full=$(git rev-parse --verify "$sha^{commit}" 2>/dev/null)
+      if [[ -z "$full" ]]; then
+        echo "WARNING: cannot resolve '$sha'" >&2
+        continue
+      fi
+
+      # Collect orig + its fixups
+      shas_to_add=("$full")
+      if [[ -n "${_mark_fmap[$full]+_}" ]]; then
+        read -ra fixups <<< "${_mark_fmap[$full]}"
+        shas_to_add+=("${fixups[@]}")
+      fi
+
+      for s in "${shas_to_add[@]}"; do
+        [[ -n "${existing[$s]+_}" ]] && continue
+        subj=$(git log --no-walk --format="%s" "$s")
+        echo "$s  # $subj" >> "$backported_file"
+        existing[$s]=1
+        added=$((added + 1))
+      done
+    done
+    echo "Added $added SHA(s) to $backported_file"
+    ;;
+
+
+  --pr-message)
+    # Generate a PR description from the backport plan merge commits.
+    echo "## Backport from develop"
+    echo ""
+    orphans=()
+    while IFS= read -r line; do
+      tag="${line%% *}"
+      rest="${line#* }"
+      sha="${rest%% *}"
+      case "$tag" in
+        merge)
+          subj=$(git log --no-walk --format="%s" "$sha")
+          # Strip PR number suffix like " (#34)"
+          subj=$(echo "$subj" | sed 's/ (#[0-9]*)$//') 
+          body=$(git log --no-walk --format="%b" "$sha")
+          echo "---"
+          echo ""
+          echo "### $subj"
+          echo ""
+          if [[ -n "$body" ]]; then
+            echo "$body"
+          fi
+          ;;
+        orphan)
+          subj=$(git log --no-walk --oneline "$sha")
+          subj="${subj%% FIXUPS:*}"
+          orphans+=("$subj")
+          ;;
+      esac
+    done < <(iter_ordered | grep -v " fork:")
+    if (( ${#orphans[@]} > 0 )); then
+      echo "---"
+      echo ""
+      echo "### Other commits"
+      echo ""
+      for o in "${orphans[@]}"; do
+        echo "- $o"
+      done
+    fi
+    ;;
   *)
-    echo "Usage: $0 [--list|--merges|--graph|--ordered|--backport-plan [<backport-branch> [<base>]]]" >&2
+    echo "Usage: $0 [--list|--merges|--graph|--ordered|--backport-plan|--check-backported|--mark-backported]" >&2
     exit 1
     ;;
 esac
