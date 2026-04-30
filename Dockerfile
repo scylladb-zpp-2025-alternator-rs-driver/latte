@@ -1,8 +1,8 @@
-FROM rust:1.90-slim-trixie AS builder
+FROM rust:1.94-slim-trixie AS builder
 
 WORKDIR /usr/src/app
 
-ENV RUSTFLAGS="--cfg fetch_extended_version_info"
+ENV RUSTFLAGS="--cfg fetch_extended_version_info --cfg tokio_unstable"
 
 COPY . .
 
