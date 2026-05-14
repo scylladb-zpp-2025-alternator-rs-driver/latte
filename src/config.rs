@@ -156,6 +156,94 @@ impl FromStr for RetryInterval {
     }
 }
 
+#[cfg(feature = "alternator-new")]
+fn parse_compression_level(s: &str) -> Result<u8, String> {
+    let n: u8 = s
+        .parse()
+        .map_err(|_| format!("Invalid compression level: {s} (expected integer 1-9)"))?;
+    if (1..=9).contains(&n) {
+        Ok(n)
+    } else {
+        Err("Compression level must be between 1 and 9".to_string())
+    }
+}
+
+/// HTTP request body compression mode for the alternator-driver client (`latte-alternator-new` only).
+#[cfg(feature = "alternator-new")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum AlternatorRequestCompressionMode {
+    /// Use alternator-driver defaults (gzip, 1024-byte threshold).
+    #[default]
+    DriverDefault,
+    Off,
+    Gzip,
+    Zlib,
+}
+
+#[cfg(feature = "alternator-new")]
+const DEFAULT_COMPRESSION_THRESHOLD: usize = 1024;
+
+/// Alternator-driver connection options (only when built with `alternator-new`).
+#[cfg(feature = "alternator-new")]
+#[derive(Parser, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AlternatorNewConnectionOpts {
+    /// How to compress DynamoDB request bodies before signing (alternator-driver).
+    #[clap(
+        long("alternator-request-compression"),
+        required = false,
+        default_value = "driver-default",
+        value_name = "MODE",
+        value_enum
+    )]
+    pub request_compression: AlternatorRequestCompressionMode,
+
+    /// Minimum uncompressed body size in bytes before compression applies (`gzip` / `zlib` only).
+    #[clap(
+        long("alternator-compression-threshold"),
+        required = false,
+        default_value_t = DEFAULT_COMPRESSION_THRESHOLD,
+        value_name = "BYTES"
+    )]
+    pub compression_threshold: usize,
+
+    /// Deflate compression level 1–9 (`gzip` / `zlib` only). If omitted, the driver default level is used.
+    #[clap(
+        long("alternator-compression-level"),
+        required = false,
+        value_name = "1-9",
+        value_parser = parse_compression_level
+    )]
+    pub compression_level: Option<u8>,
+
+    /// Strip request headers not used by Alternator before transmit. If omitted, the driver default (true) applies.
+    #[clap(
+        long("alternator-enforce-header-whitelist"),
+        required = false,
+        value_name = "BOOL"
+    )]
+    pub enforce_header_whitelist: Option<bool>,
+}
+
+/// Serde hook: missing `compression_threshold` in a report must not deserialize as `usize::default()` (0).
+#[cfg(feature = "alternator-new")]
+fn default_compression_threshold() -> usize {
+    DEFAULT_COMPRESSION_THRESHOLD
+}
+
+#[cfg(feature = "alternator-new")]
+impl Default for AlternatorNewConnectionOpts {
+    fn default() -> Self {
+        Self {
+            request_compression: AlternatorRequestCompressionMode::default(),
+            compression_threshold: default_compression_threshold(),
+            compression_level: None,
+            enforce_header_whitelist: None,
+        }
+    }
+}
+
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct ConnectionConf {
     /// List of addresses to connect to.
@@ -206,6 +294,12 @@ pub struct ConnectionConf {
     #[clap(flatten)]
     #[serde(flatten)]
     pub db: db_config::DbConnectionConf,
+
+    /// Alternator-driver tuning (request compression and header handling).
+    #[cfg(feature = "alternator-new")]
+    #[clap(flatten)]
+    #[serde(flatten)]
+    pub alternator_new: AlternatorNewConnectionOpts,
 }
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -830,6 +924,77 @@ mod tests {
         #[test]
         fn empty_string_returns_none() {
             assert!(RetryInterval::new("").is_none());
+        }
+    }
+
+    #[cfg(feature = "alternator-new")]
+    mod alternator_new_connection_opts_tests {
+        use super::super::{AlternatorRequestCompressionMode, SchemaCommand};
+        use clap::Parser;
+
+        fn parse_schema(args: &[&str]) -> SchemaCommand {
+            SchemaCommand::try_parse_from(std::iter::once("latte").chain(args.iter().copied()))
+                .unwrap()
+        }
+
+        #[test]
+        fn default_request_compression_and_whitelist() {
+            let c = parse_schema(&["w.rn", "http://h:1"]);
+            assert_eq!(
+                c.connection.alternator_new.request_compression,
+                AlternatorRequestCompressionMode::DriverDefault
+            );
+            assert!(c
+                .connection
+                .alternator_new
+                .enforce_header_whitelist
+                .is_none());
+            assert_eq!(c.connection.alternator_new.compression_threshold, 1024);
+            assert!(c.connection.alternator_new.compression_level.is_none());
+        }
+
+        #[test]
+        fn parse_compression_flags() {
+            let c = parse_schema(&[
+                "w.rn",
+                "http://h:1",
+                "--alternator-request-compression",
+                "zlib",
+                "--alternator-enforce-header-whitelist",
+                "false",
+                "--alternator-compression-threshold",
+                "2048",
+                "--alternator-compression-level",
+                "7",
+            ]);
+            assert_eq!(
+                c.connection.alternator_new.request_compression,
+                AlternatorRequestCompressionMode::Zlib
+            );
+            assert_eq!(
+                c.connection.alternator_new.enforce_header_whitelist,
+                Some(false)
+            );
+            assert_eq!(c.connection.alternator_new.compression_threshold, 2048);
+            assert_eq!(c.connection.alternator_new.compression_level, Some(7));
+        }
+    }
+
+    #[cfg(feature = "alternator-new")]
+    mod parse_compression_level_tests {
+        use super::super::parse_compression_level;
+
+        #[test]
+        fn accepts_levels_one_through_nine() {
+            for n in 1u8..=9u8 {
+                assert_eq!(parse_compression_level(&n.to_string()).unwrap(), n);
+            }
+        }
+
+        #[test]
+        fn rejects_out_of_range() {
+            assert!(parse_compression_level("0").is_err());
+            assert!(parse_compression_level("10").is_err());
         }
     }
 }
