@@ -519,6 +519,18 @@ impl Display for RunConfigCmp<'_> {
                     .serial_consistency()
                     .to_string()
             }),
+            #[cfg(feature = "alternator-new")]
+            self.line("Alternator request compression", "", |conf| {
+                format!("{:?}", conf.connection.alternator_new.request_compression)
+            }),
+            #[cfg(feature = "alternator-new")]
+            self.line("Alternator header whitelist", "", |conf| {
+                conf.connection
+                    .alternator_new
+                    .enforce_header_whitelist
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "default".to_string())
+            }),
             self.line("Tags", "", |conf| conf.tags.iter().join(", ")),
         ];
 
